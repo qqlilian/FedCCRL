@@ -1,0 +1,420 @@
+#FedCCRL+对齐损失补齐后
+import random
+from collections import OrderedDict
+
+import matplotlib.pyplot as plt
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import transforms
+from torchvision.transforms import AugMix
+
+from algorithm.client.fedavg import FedAvgClient
+from model.models import MixStyle, FedCCRLDualModel
+from utils.optimizers_shcedulers import get_optimizer, CosineAnnealingLRWithWarmup
+from utils.tools import get_best_device, local_time
+
+
+class FedCCRLLSDAClient(FedAvgClient):
+    def __init__(self, args, dataset, client_id, logger):
+        super(FedCCRLLSDAClient, self).__init__(args, dataset, client_id, logger)
+        self.MixStyle = MixStyle(self.args.p, 0.1, self.args.epsilon)
+
+    # ==========================================================
+    # 初始化双分支模型
+    # ==========================================================
+    def initialize_model(self):
+        self.classification_model = FedCCRLDualModel(
+            model_name=self.args.model,
+            dataset=self.args.dataset,
+        )
+        self.device = None
+
+        # 用 invariant 分支初始化 source-aware 分支一次
+        self.classification_model.init_source_from_invariant()
+
+        inv_params = list(self.classification_model.inv_backbone.parameters()) + \
+                     list(self.classification_model.inv_classifier.parameters())
+
+        src_params = list(self.classification_model.src_backbone.parameters()) + \
+                     list(self.classification_model.src_classifier.parameters())
+
+        if self.args.optimizer.lower() == "adam":
+            self.optimizer_inv = optim.Adam(
+                inv_params, lr=self.args.lr, weight_decay=self.args.weight_decay
+            )
+            self.optimizer_src = optim.Adam(
+                src_params, lr=self.args.lr, weight_decay=self.args.weight_decay
+            )
+        elif self.args.optimizer.lower() == "sgd":
+            self.optimizer_inv = optim.SGD(
+                inv_params, lr=self.args.lr, weight_decay=self.args.weight_decay, momentum=0.9
+            )
+            self.optimizer_src = optim.SGD(
+                src_params, lr=self.args.lr, weight_decay=self.args.weight_decay, momentum=0.9
+            )
+        else:
+            raise ValueError(f"Unsupported optimizer: {self.args.optimizer}")
+
+        # 两个分支各自 scheduler
+        self.scheduler_inv = CosineAnnealingLRWithWarmup(
+            optimizer=self.optimizer_inv,
+            total_epochs=self.args.num_epochs * self.args.round,
+        )
+        self.scheduler_src = CosineAnnealingLRWithWarmup(
+            optimizer=self.optimizer_src,
+            total_epochs=self.args.num_epochs * self.args.round,
+        )
+
+    # ==========================================================
+    # 只加载服务端下发的 invariant 分支参数
+    # ==========================================================
+    def load_model_weights(self, model_weights):
+        self.classification_model.load_invariant_state_dict(model_weights)
+
+    # ==========================================================
+    # 只上传 invariant 分支参数
+    # ==========================================================
+    def get_model_weights(self) -> OrderedDict:
+        return self.classification_model.get_invariant_state_dict()
+
+    # ==========================================================
+    # 设备迁移
+    # ==========================================================
+    def move2new_device(self):
+        device = get_best_device(self.args.use_cuda)
+        self.classification_model.to(device)
+
+        if self.device is None or self.device != device:
+            optimizer_inv_state = self.optimizer_inv.state_dict()
+            optimizer_src_state = self.optimizer_src.state_dict()
+            scheduler_inv_state = self.scheduler_inv.state_dict()
+            scheduler_src_state = self.scheduler_src.state_dict()
+
+            inv_params = list(self.classification_model.inv_backbone.parameters()) + \
+                         list(self.classification_model.inv_classifier.parameters())
+
+            src_params = list(self.classification_model.src_backbone.parameters()) + \
+                         list(self.classification_model.src_classifier.parameters())
+
+            if self.args.optimizer.lower() == "adam":
+                self.optimizer_inv = optim.Adam(
+                    inv_params, lr=self.args.lr, weight_decay=self.args.weight_decay
+                )
+                self.optimizer_src = optim.Adam(
+                    src_params, lr=self.args.lr, weight_decay=self.args.weight_decay
+                )
+            elif self.args.optimizer.lower() == "sgd":
+                self.optimizer_inv = optim.SGD(
+                    inv_params, lr=self.args.lr, weight_decay=self.args.weight_decay, momentum=0.9
+                )
+                self.optimizer_src = optim.SGD(
+                    src_params, lr=self.args.lr, weight_decay=self.args.weight_decay, momentum=0.9
+                )
+            else:
+                raise ValueError(f"Unsupported optimizer: {self.args.optimizer}")
+
+            self.scheduler_inv = CosineAnnealingLRWithWarmup(
+                optimizer=self.optimizer_inv,
+                total_epochs=self.args.num_epochs * self.args.round,
+            )
+            self.scheduler_src = CosineAnnealingLRWithWarmup(
+                optimizer=self.optimizer_src,
+                total_epochs=self.args.num_epochs * self.args.round,
+            )
+
+            self.optimizer_inv.load_state_dict(optimizer_inv_state)
+            self.optimizer_src.load_state_dict(optimizer_src_state)
+            self.scheduler_inv.load_state_dict(scheduler_inv_state)
+            self.scheduler_src.load_state_dict(scheduler_src_state)
+
+            self.dataset.device = device
+            self.device = device
+
+    # ==========================================================
+    # 原始 FedCCRL 的统计量上传逻辑：不改
+    # ==========================================================
+    @torch.no_grad()
+    def compute_statistic(self):
+        self.move2new_device()
+        local_statistic_pool = {"mean": [], "std": []}
+        num2upload = int(len(self.train_loader.dataset) * self.args.r)
+        batches = int(num2upload / self.args.batch_size)
+        left_num = num2upload % self.args.batch_size
+
+        for enu, (data, target) in enumerate(self.train_loader):
+            data = data.to(self.device)
+            mean = torch.mean(data, dim=(2, 3), keepdim=True)
+            var = torch.var(data, dim=(2, 3), keepdim=True)
+            std = (var + self.args.epsilon).sqrt()
+
+            if enu != batches:
+                local_statistic_pool["mean"].append(mean)
+                local_statistic_pool["std"].append(std)
+            else:
+                if left_num > 0:
+                    local_statistic_pool["mean"].append(mean[:left_num])
+                    local_statistic_pool["std"].append(std[:left_num])
+                break
+
+        if len(local_statistic_pool["mean"]) == 0:
+            sample_batch = next(iter(self.train_loader))[0].to(self.device)
+            mean = torch.mean(sample_batch[:1], dim=(2, 3), keepdim=True)
+            var = torch.var(sample_batch[:1], dim=(2, 3), keepdim=True)
+            std = (var + self.args.epsilon).sqrt()
+            local_statistic_pool["mean"].append(mean)
+            local_statistic_pool["std"].append(std)
+
+        local_statistic_pool["mean"] = torch.cat(
+            local_statistic_pool["mean"], dim=0
+        ).to(torch.device("cpu"))
+        local_statistic_pool["std"] = torch.cat(
+            local_statistic_pool["std"], dim=0
+        ).to(torch.device("cpu"))
+
+        return local_statistic_pool
+
+    def download_statistic_pool(self, statistic_pool):
+        self.statistic_pool = {}
+        statistic_pool["mean"].pop(self.client_id)
+        statistic_pool["std"].pop(self.client_id)
+        statistic_pool["mean"] = [x.to(self.device) for x in statistic_pool["mean"]]
+        statistic_pool["std"] = [x.to(self.device) for x in statistic_pool["std"]]
+        self.statistic_pool["mean"] = torch.cat(statistic_pool["mean"], dim=0)
+        self.statistic_pool["std"] = torch.cat(statistic_pool["std"], dim=0)
+
+    def sample_statistic(self, current_batch_size):
+        num = self.statistic_pool["mean"].shape[0]
+        if num >= current_batch_size:
+            indices = torch.randperm(num, device=self.statistic_pool["mean"].device)[
+                :current_batch_size
+            ]
+        else:
+            indices = torch.randint(
+                0,
+                num,
+                (current_batch_size,),
+                device=self.statistic_pool["mean"].device,
+            )
+        sampled_mean = self.statistic_pool["mean"][indices]
+        sampled_std = self.statistic_pool["std"][indices]
+        return sampled_mean, sampled_std
+
+    # ==========================================================
+    # KL(logits_a || logits_b)
+    # ==========================================================
+    def kl_div_logits(self, student_logits, teacher_logits, T=1.0):
+        return F.kl_div(
+            F.log_softmax(student_logits / T, dim=1),
+            F.softmax(teacher_logits / T, dim=1),
+            reduction="batchmean",
+        ) * (T * T)
+
+    # ==========================================================
+    # 原始 FedCCRL 的 supervised contrastive loss
+    # ==========================================================
+    def supervised_contrastive_loss(self, x, y, label, temperature):
+        x_norm = torch.norm(x, dim=1, keepdim=True).clamp_min(1e-12)
+        y_norm = torch.norm(y, dim=1, keepdim=True).clamp_min(1e-12)
+        x = x / x_norm
+        y = y / y_norm
+
+        samples = torch.cat((x, y), dim=0)
+        label = torch.cat((label, label), dim=0)
+
+        same_label_matrix = torch.eq(label.unsqueeze(1), label.unsqueeze(0)).float()
+        sim = torch.matmul(samples, samples.T) / temperature
+        same_label_sim = sim * same_label_matrix
+        same_label_num = torch.sum(same_label_matrix, dim=1).clamp_min(1.0)
+
+        negative_sim = torch.exp(sim)
+        negative_sum = torch.log(
+            torch.sum(negative_sim, dim=1) - negative_sim.diag() + 1e-12
+        )
+        positive_sum = torch.sum(same_label_sim, dim=1) / same_label_num
+        loss = torch.mean(-positive_sum + negative_sum)
+        return loss
+
+    # ==========================================================
+    # 双分支训练
+    # ==========================================================
+    def train(self):
+        self.move2new_device()
+        self.classification_model.train()
+        criterion = torch.nn.CrossEntropyLoss()
+
+        kd_T = self.args.kd_T
+        alpha = self.args.alpha
+
+        for _ in range(self.args.num_epochs):
+            total_inv_loss = 0.0
+            total_src_loss = 0.0
+
+            for batch_idx, (data, target) in enumerate(self.train_loader):
+                data = data.to(self.device)
+                target = target.to(self.device)
+
+                # --------------------------------------------------
+                # 1) invariant 分支
+                # loss_inv = FedCCRL原始损失 + alpha * KL(inv || src)
+                # --------------------------------------------------
+                self.optimizer_inv.zero_grad()
+
+                feature_1, output_inv_logits = self.classification_model.forward_inv(data)
+                loss_inv = criterion(output_inv_logits, target)
+
+                output_inv_prob = F.softmax(output_inv_logits, dim=1)
+                mix_output = []
+                mix_feature = []
+
+                for _ in range(2):
+                    mu2, std2 = self.sample_statistic(len(data))
+                    generated_data = self.MixStyle(data, mu2, std2)
+                    generated_data = self.AugMixAugmentation(generated_data)
+
+                    feature, pred_logits = self.classification_model.forward_inv(
+                        generated_data
+                    )
+                    loss_inv += criterion(pred_logits, target)
+
+                    if self.args.lambda2 > 0:
+                        mix_output.append(F.softmax(pred_logits, dim=1))
+                    if self.args.lambda1 > 0:
+                        mix_feature.append(feature)
+
+                if self.args.lambda3 > 0:
+                    consistency_loss = 0.0
+                    for mix_feat in mix_feature:
+                        consistency_loss += F.mse_loss(mix_feat, feature_1)  # ||h(X) - h(X_aug)||
+                    loss_inv += self.args.lambda3 * (consistency_loss / len(mix_feature))
+
+                if self.args.lambda2 > 0:
+                    M = torch.clamp(
+                        (output_inv_prob + mix_output[0] + mix_output[1]) / 3,
+                        1e-7,
+                        1.0,
+                    ).log()
+                    kl_1 = F.kl_div(M, output_inv_prob, reduction="batchmean")
+                    kl_2 = F.kl_div(M, mix_output[0], reduction="batchmean")
+                    kl_3 = F.kl_div(M, mix_output[1], reduction="batchmean")
+                    JS_loss = (kl_1 + kl_2 + kl_3) / 3
+                    loss_inv += self.args.lambda2 * JS_loss
+
+                if self.args.lambda1 > 0:
+                    representation_alignment_loss = (
+                        self.supervised_contrastive_loss(
+                            mix_feature[0], feature_1, target, temperature=self.args.t
+                        )
+                        + self.supervised_contrastive_loss(
+                            mix_feature[1], feature_1, target, temperature=self.args.t
+                        )
+                    ) / 2
+                    loss_inv += self.args.lambda1 * representation_alignment_loss
+
+                # invariant 分支的 LSDA: KL(z_inv || z_src)
+                _, src_logits_for_inv = self.classification_model.forward_src(data)
+                lsda_inv = self.kl_div_logits(
+                    output_inv_logits,
+                    src_logits_for_inv.detach(),
+                    T=kd_T,
+                )
+                loss_inv += alpha * lsda_inv
+
+                loss_inv.backward()
+                self.optimizer_inv.step()
+
+                # --------------------------------------------------
+                # 2) source-aware 分支
+                # loss_src = CE + alpha * KL(src || inv)
+                # --------------------------------------------------
+                self.optimizer_src.zero_grad()
+
+                _, output_src_logits = self.classification_model.forward_src(data)
+                with torch.no_grad():
+                    _, inv_logits_detached = self.classification_model.forward_inv(data)
+
+                loss_src = criterion(output_src_logits, target)
+                lsda_src = self.kl_div_logits(
+                    output_src_logits,
+                    inv_logits_detached.detach(),
+                    T=kd_T,
+                )
+                loss_src += alpha * lsda_src
+
+                loss_src.backward()
+                self.optimizer_src.step()
+
+                total_inv_loss += loss_inv.item()
+                total_src_loss += loss_src.item()
+
+            self.scheduler_inv.step()
+            self.scheduler_src.step()
+
+        average_inv_loss = total_inv_loss / len(self.train_loader)
+        average_src_loss = total_src_loss / len(self.train_loader)
+
+        self.classification_model.to(torch.device("cpu"))
+        del self.statistic_pool
+        torch.cuda.empty_cache()
+
+        self.logger.log(
+            f"{local_time()}, Client {self.client_id}, "
+            f"Avg Inv Loss: {average_inv_loss:.4f}, "
+            f"Avg Src Loss: {average_src_loss:.4f}"
+        )
+
+    # ==========================================================
+    # 原始 FedCCRL 的增强辅助函数：不改
+    # ==========================================================
+    def denormalize(self, tensor, mean, std):
+        mean = torch.as_tensor(mean).reshape(1, -1, 1, 1).to(tensor.device)
+        std = torch.as_tensor(std).reshape(1, -1, 1, 1).to(tensor.device)
+        return tensor * std + mean
+
+    def AugMixAugmentation(self, input_images):
+        mean = torch.tensor([0.485, 0.456, 0.406]).to(input_images.device)
+        std = torch.tensor([0.229, 0.224, 0.225]).to(input_images.device)
+        input_images = self.denormalize(input_images, mean, std)
+        input_images = input_images * 255.0
+        input_images = input_images.to(torch.uint8)
+        augmix = AugMix()
+        augmixed_images = augmix(input_images)
+        augmixed_images = augmixed_images.float().div(255.0)
+        augmixed_images = transforms.Normalize(mean, std)(augmixed_images)
+        return augmixed_images
+
+    def scale2unit(self, tensor):
+        return (tensor - tensor.min()) / (tensor.max() - tensor.min() + 1e-12)
+
+    def visualize_augmentation_effect(self, path2dir):
+        data_iter = iter(self.train_loader)
+        data, _ = next(data_iter)
+        data = data.to(self.device)
+
+        random.seed(None)
+        random_index = random.randint(0, len(data) - 1)
+        sample_image = data[random_index]
+        mu2, std2 = self.sample_statistic(1)
+        mixstyled_image = self.MixStyle(sample_image.unsqueeze(0), mu2, std2).squeeze(0)
+        mixstyled_image = self.scale2unit(mixstyled_image)
+        augmixed_image = self.AugMixAugmentation(mixstyled_image.unsqueeze(0)).squeeze(0)
+
+        sample_image = self.scale2unit(sample_image)
+        mixstyled_image = self.scale2unit(mixstyled_image)
+        augmixed_image = self.scale2unit(augmixed_image)
+
+        original_image_path = f"{path2dir}/original_image.png"
+        plt.imsave(
+            original_image_path,
+            sample_image.permute(1, 2, 0).detach().cpu().numpy(),
+        )
+        mixstyle_image_path = f"{path2dir}/mixstyle_image.png"
+        plt.imsave(
+            mixstyle_image_path,
+            mixstyled_image.permute(1, 2, 0).detach().cpu().numpy(),
+        )
+        augmix_image_path = f"{path2dir}/augmix_image.png"
+        plt.imsave(
+            augmix_image_path,
+            augmixed_image.permute(1, 2, 0).detach().cpu().numpy(),
+        )
